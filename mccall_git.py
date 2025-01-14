@@ -7,7 +7,7 @@ from matplotlib.colors import LinearSegmentedColormap
 class McCallModelEnv:
     def __init__(self, wage_min=0, wage_max=100, value_match=200, age_start=20, age_retire=60,
                   unemployment_penalty=5.0, gamma=1., p_exit=0.01, age_based_mode=False, 
-                  use_random_reservation_wage=False, worker_only_mode=False, firm_only_mode=False):
+                  use_random_reservation_wage=False, worker_only_mode=False, firm_only_mode=False, random_mode = False):
         
         self.wage_min = wage_min
         self.wage_max = wage_max
@@ -25,9 +25,10 @@ class McCallModelEnv:
         self.p_exit = p_exit
         self.use_random_reservation_wage = use_random_reservation_wage
 
-        # worker only mode
+        # worker/firm only mode
         self.worker_only_mode = worker_only_mode
         self.firm_only_mode = firm_only_mode
+        self.random_mode = random_mode
 
         self.gamma = gamma
         self.reset()
@@ -37,12 +38,12 @@ class McCallModelEnv:
         if self.worker_only_mode or self.firm_only_mode:
             self.reservation_wage = 50
             return self.reservation_wage
-        else:
-            if self.use_random_reservation_wage:
-                self.reservation_wage = np.random.uniform(
-                    self.wage_min + 0.3 * (self.wage_max - self.wage_min),
-                    self.wage_min + 0.7 * (self.wage_max - self.wage_min)
-                )
+        elif self.random_mode:
+            self.reservation_wage = np.random.uniform(
+                self.wage_min + 0.3 * (self.wage_max - self.wage_min),
+                self.wage_min + 0.7 * (self.wage_max - self.wage_min)
+            )
+        elif self.age_based_mode:
             self.current_age = np.random.randint(self.age_start, self.age_retire)
             return self.current_age
     
@@ -63,44 +64,61 @@ class McCallModelEnv:
         elif self.firm_only_mode:
             if wage_offer >= self.reservation_wage:
                 action = 1
-                self.done = True
                 reward = self.value_match - wage_offer
-                # print("Firm accepted offer of ", wage_offer)
+                self.done = True
             else:
                 action = 0
-                self.done = False
                 reward = -self.unemployment_penalty
-                # print("Firm rejected offer of ", wage_offer)
-            # random exit
-            if np.random.rand() < self.p_exit:
-                self.done = True
+                self.done = False
+                if np.random.rand() < self.p_exit:
+                    self.done = True
+            
             return reward, self.done, action
+
+        elif self.random_mode:
+            if wage_offer >= self.reservation_wage:
+                action = 1
+                firm_reward = self.value_match - wage_offer
+                worker_reward = wage_offer
+                self.done = True
+            else:
+                action = 0
+                firm_reward, worker_reward = -self.unemployment_penalty
+                self.done = False
+                if np.random.rand() < self.p_exit:
+                    self.done = True
+            
+            return firm_reward, worker_reward, self.done, action
         
         # if age-based
-        else:
+        elif self.age_based_mode:
             # Age-based reservation wage
             reservation_wage = np.clip(
                 self.wage_min + (self.wage_max - self.wage_min) * 
                 (self.age_retire - self.current_age) / (self.age_retire - self.age_start),
                 self.wage_min, self.wage_max
             )
+            if wage_offer >= reservation_wage:
+                action = 1 # accept
+                firm_profit = self.value_match - wage_offer
+                worker_reward = wage_offer
+                self.done = True
+            else:
+                action = 0 # reject
+                firm_profit = -self.unemployment_penalty
+                worker_reward = -self.unemployment_penalty
+                self.done = False
+
+            self.current_age += 1
+            if self.current_age >= self.age_retire:
+                self.done = True
+
+            return firm_profit, worker_reward, self.done, action
         
-        if wage_offer >= reservation_wage:
-            action = 1 # accept
-            firm_profit = self.value_match - wage_offer
-            worker_reward = wage_offer
-            self.done = True
         else:
-            action = 0 # reject
-            firm_profit = -self.unemployment_penalty
-            worker_reward = -self.unemployment_penalty
-            self.done = False
-
-        self.current_age += 1
-        if self.current_age >= self.age_retire:
-            self.done = True
-
-        return firm_profit, worker_reward, self.done, action
+            raise ValueError("Invalid mode")
+        
+        
 
 # %%
 class WorkerAgent:
@@ -277,8 +295,63 @@ def simulate(env, n_episodes, agent):
         )
 
         return total_firm_offers, accepted_firm_offers, acceptance_rates
+    
+    elif env.random_mode:
+        firm = FirmAgent(n_states=40, n_wage_levels=20, epsilon=1.0, epsilon_decay=0.995)
+        worker = WorkerAgent(n_states=150, n_actions=2, use_age_based=False, epsilon=1.0, epsilon_decay=0.995)
 
-    else:
+        firm_offers = np.zeros(firm.n_wage_levels)
+        worker_accepts = np.zeros_like(firm_offers)
+        firm_profits = []
+
+        for episode in range(n_episodes):
+            env.reset()
+            done = False
+            total_profit = 0
+
+            while not done:
+                # Firm state logic
+                firm_state = 0
+                firm_action_index = firm.choose_action(firm_state, episode, n_episodes)
+                wage_offer = env.wage_min + firm_action_index * (env.wage_max - env.wage_min) / firm.n_wage_levels
+
+                firm_offers[firm_action_index] += 1
+
+                worker_state = worker.get_state(wage_offer, env)
+                worker_action = worker.choose_action(worker_state, episode, n_episodes)
+
+                if worker_action == 1 and wage_offer >= env.reservation_wage:
+                    worker_reward = wage_offer
+                    firm_reward = env.value_match - wage_offer
+                    action_taken = 1
+                    done = True
+                else:
+                    worker_reward = -1  # Penalty for rejecting
+                    firm_reward = -env.unemployment_penalty  # Firm penalty for rejection
+                    action_taken = 0
+                    if np.random.rand() < env.p_exit:  # Worker exits
+                        done = True
+                
+                firm_reward = env.value_match - wage_offer if action_taken == 1 else -env.unemployment_penalty
+                worker_reward = wage_offer if action_taken == 1 else -env.unemployment_penalty
+
+                next_firm_state = firm_state
+                next_worker_state = worker_state
+
+                firm.update_q_table(firm_state, firm_action_index, firm_reward, next_firm_state, done)
+                worker.update_q_table(worker_state, worker_action, worker_reward, next_worker_state, done)
+
+                if action_taken == 1:
+                    worker_accepts[firm_action_index] += 1
+                    total_profit += firm_reward
+            
+            firm_profits.append(total_profit)
+        
+        acceptance_rates = np.divide(worker_accepts, firm_offers, out=np.zeros_like(worker_accepts, dtype=float), where=firm_offers != 0)
+
+        return firm_offers, worker_accepts, acceptance_rates, firm_profits 
+
+    elif env.age_based_mode:
         firm = agent
         # Track firm decisions and worker responses
         firm_offers = np.zeros((firm.n_wage_levels, env.age_retire - env.age_start)) if not env.use_random_reservation_wage else np.zeros((firm.n_wage_levels))
@@ -331,28 +404,35 @@ def simulate(env, n_episodes, agent):
         acceptance_rates = np.divide(worker_accepts, firm_offers, out=np.zeros_like(worker_accepts, dtype=float), where=firm_offers != 0)
 
         return firm_offers, worker_accepts, acceptance_rates, firm_profits
+    
+    else:
+        raise ValueError("Invalid mode")
 
 # %%
 # Environment setup
 worker_only_env = McCallModelEnv(worker_only_mode=True)
 firm_only_env = McCallModelEnv(firm_only_mode=True, p_exit=0.02)
-random_env = McCallModelEnv(use_random_reservation_wage=True, p_exit=0.02) # firm + worker but need to fix a bit (add worker)
-age_based_env = McCallModelEnv(use_random_reservation_wage=False)
+random_env = McCallModelEnv(random_mode=True, p_exit=0.02) # firm + worker but need to fix a bit (add worker)
+age_based_env = McCallModelEnv(age_based_mode=True)
 
 # Agent setup
 firm = FirmAgent(n_states=40, n_wage_levels=20)
-worker = WorkerAgent(n_states=150, n_actions=2, use_age_based=False)  # Set use_age_based=True if needed
+worker = WorkerAgent(n_states=150, n_actions=2, use_age_based=False)
 
 # Number of episodes
 n_episodes = 150000
 
-# Simulations
+# -- simulations --
+
 # worker only
 wage_bins, worker_only_acceptance_rates, worker_q_table = simulate(worker_only_env, n_episodes, agent=worker)
+
 # firm only
 total_offers, accepted_offers, acceptance_rates = simulate(firm_only_env, n_episodes, firm)
+
 # mixed firm + worker
-random_results = simulate(random_env, n_episodes, agent=firm) 
+firm_offers, worker_accepts, acceptance_rates, firm_profits = simulate(random_env, n_episodes, agent=firm)
+
 age_based_results = simulate(age_based_env, n_episodes, agent=firm)
 
 # %%
@@ -394,22 +474,30 @@ plt.tight_layout()
 plt.show()
 
 # %%
-fig, axes = plt.subplots(figsize=(6, 4))
+# Calculate midpoints for wage bins
+wage_bins = np.linspace(random_env.wage_min, random_env.wage_max, firm.n_wage_levels + 1)
+wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
 
-# Random Model: Firm's Wage Offer Graph
-if random_env.use_random_reservation_wage:
-    im3 = axes.bar(np.arange(random_env.wage_min, random_env.wage_max, (random_env.wage_max - random_env.wage_min) / firm.n_wage_levels),
-                         random_results[0], color='blue', alpha=0.7)
-    axes.set_title('Random Exit: Firm Wage Offer Frequency')
-    axes.set_xlabel('Wage Offered')
-    axes.set_ylabel('Frequency')
-else:
-    im3 = axes.imshow(random_results[0].T, origin='lower', aspect='auto', cmap='Blues',
-                          extent=[random_env.age_start, random_env.age_retire, random_env.wage_min, random_env.wage_max])
-    fig.colorbar(im3, ax=axes, label='Offer Frequency')
-
+# Plot firm offers
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.bar(wage_bin_midpoints, firm_offers, color='blue', alpha=0.7, label='Total Firm Offers')
+ax.set_title('Firm Wage Offer Frequency')
+ax.set_xlabel('Wage Offered')
+ax.set_ylabel('Frequency')
+ax.legend()
 plt.tight_layout()
 plt.show()
+
+# Plot acceptance rates
+fig, ax = plt.subplots(figsize=(6, 4))
+ax.bar(wage_bin_midpoints, acceptance_rates, color='green', alpha=0.7, label='Worker Acceptance Rates')
+ax.set_title('Worker Acceptance Rates by Wage Offer')
+ax.set_xlabel('Wage Offered')
+ax.set_ylabel('Acceptance Rate')
+ax.legend()
+plt.tight_layout()
+plt.show()
+
 
 # %%
 fig, axes = plt.subplots(figsize=(6, 4))
@@ -438,3 +526,5 @@ fig.colorbar(im2, ax=axes, label='Acceptance Rate')
 
 plt.tight_layout()
 plt.show()
+
+
