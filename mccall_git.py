@@ -6,7 +6,7 @@ from matplotlib.colors import LinearSegmentedColormap
 # defining the environment
 class McCallModelEnv:
     def __init__(self, wage_min=0, wage_max=100, value_match=200, age_start=20, age_retire=60,
-                  unemployment_penalty=5.0, gamma=1., p_exit=0.01, age_based_mode=False, 
+                  unemployment_penalty=4.0, gamma=1., p_exit=0.01, age_based_mode=False, 
                   use_random_reservation_wage=False, worker_only_mode=False, firm_only_mode=False, random_mode = False):
         
         self.wage_min = wage_min
@@ -35,16 +35,20 @@ class McCallModelEnv:
 
     def reset(self):
         self.done = False
-        if self.worker_only_mode or self.firm_only_mode:
-            self.reservation_wage = 50
+        if self.worker_only_mode or self.firm_only_mode or self.random_mode:
+            self.reservation_wage = self.calculate_reservation_wage(
+            gamma=self.gamma,
+            wage_min=self.wage_min,
+            wage_max=self.wage_max,
+            unemployment_penalty=self.unemployment_penalty,
+            num_wages=100
+        )
+            # print(f"Calculated Reservation Wage: {self.reservation_wage}")
             return self.reservation_wage
-        elif self.random_mode:
-            self.reservation_wage = np.random.uniform(
-                self.wage_min + 0.3 * (self.wage_max - self.wage_min),
-                self.wage_min + 0.7 * (self.wage_max - self.wage_min)
-            )
+        
         elif self.age_based_mode:
             self.current_age = np.random.randint(self.age_start, self.age_retire)
+            self.reservation_wage = self.age_based_reservation_wage()
             return self.current_age
     
     def step(self, wage_offer):
@@ -59,6 +63,7 @@ class McCallModelEnv:
                 self.done = False
                 reward = 0
                 # print("Worker rejected offer of ", wage_offer)
+
             return reward, self.done, action # finish step here
         
         elif self.firm_only_mode:
@@ -117,8 +122,46 @@ class McCallModelEnv:
         
         else:
             raise ValueError("Invalid mode")
+    
+    # add code in simulations and reset/step jugak
+    def calculate_reservation_wage(self, gamma, wage_min, wage_max, unemployment_penalty, num_wages=100):
+        # calc the dynamic reservation wage based on the McCall model
+        wage_range = np.linspace(wage_min, wage_max, num_wages)
+        value_function = np.zeros(num_wages)  # Value function initialization
+        tolerance = 1e-3
+        max_iterations = 1000
+
+        for _ in range(max_iterations):
+            new_value_function = np.zeros_like(value_function)
+            for i, wage in enumerate(wage_range):
+                accept_value = wage  # Value of accepting the wage
+                reject_value = -unemployment_penalty + gamma * np.mean(value_function)  # Value of rejecting
+                new_value_function[i] = max(accept_value, reject_value)
+
+            if np.max(np.abs(new_value_function - value_function)) < tolerance:
+                break
+
+            value_function = new_value_function
+
+        # The reservation wage is where accepting equals rejecting
+        reservation_wage = wage_range[np.argmax(value_function >= (-unemployment_penalty + gamma * np.mean(value_function)))]
+        return reservation_wage
         
-        
+    def age_based_reservation_wage(self):
+        remaining_work_years = self.age_retire - self.current_age
+        max_work_years = self.age_retire - self.age_start
+        age_discount_factor = remaining_work_years / max_work_years
+
+        # Base reservation wage from McCall model
+        base_reservation_wage = self.calculate_reservation_wage(
+            gamma=self.gamma,
+            wage_min=self.wage_min,
+            wage_max=self.wage_max,
+            unemployment_penalty=self.unemployment_penalty,
+            num_wages=100
+        )
+        return base_reservation_wage * age_discount_factor
+
 
 # %%
 class WorkerAgent:
@@ -199,64 +242,82 @@ class FirmAgent:
         self.epsilon = max(0.01, self.epsilon * self.epsilon_decay)
 
 # %%
-def simulate(env, n_episodes, agent):
+def simulate(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
     if env.worker_only_mode:
         worker = agent
-        wage_offers = []
-        acceptances = []
+        eval_rewards = []
+        eval_acceptances = []
 
-        # check how to do RL for worker only mode - let worker determine reservation wage
+        all_wage_offers = []
+        all_acceptances = []
 
-        for episode in range(n_episodes):
-            env.reset()  # Reset environment (new reservation wage)
-            episode_wage_offers = np.linspace(env.wage_min, env.wage_max, 20)
-            np.random.shuffle(episode_wage_offers)
+        for sim in range(evaluate_after + 1):
+            env.reset()
+            cumulative_reward = 0
+            acceptances = []
 
-            for wage_offer in episode_wage_offers:
-                # Get current state
+            wage_offers = np.linspace(env.wage_min, env.wage_max, 100)
+            np.random.shuffle(wage_offers)
+
+            all_wage_offers.extend(wage_offers)
+
+            for i in range(timesteps_per_sim):
+                wage_offer = wage_offers[i]
                 state = worker.get_state(wage_offer, env)
 
-                # Choose an action (0 = Reject, 1 = Accept)
-                action = worker.choose_action(state, episode, n_episodes)
+                # Enforce acceptance above reservation wage during evaluation
+                if sim >= evaluate_after and wage_offer >= env.reservation_wage:
+                    action_taken = 1
+                    print("Worker accepted offer of ", wage_offer)
+                else:
+                    action_taken = worker.choose_action(state, sim, n_episodes)
 
-                # Step in the environment
-                _, done, action_taken = env.step(wage_offer if action == 1 else 0)
-                wage_offers.append(wage_offer)
+                reward, done, _ = env.step(wage_offer)
+                cumulative_reward += reward
                 acceptances.append(action_taken)
+                all_acceptances.append(action_taken)
 
-                # Compute reward and next state
-                # reward = wage_offer if action_taken == 1 else -1  # Penalty for rejection
+                if sim < evaluate_after:
+                    next_state = worker.get_state(wage_offer, env)
+                    worker.update_q_table(state, action_taken, reward, next_state, done)
+                    worker.decay_epsilon()
 
-                # testing other method of reward calc
-                reward = wage_offer if action_taken == 1 and wage_offer >= env.reservation_wage else -1
-
-                next_state = worker.get_state(wage_offer, env)
-
-                # Update Q-table
-                worker.update_q_table(state, action, reward, next_state, done)
-
-                if action_taken == 1:  # Stop after acceptance
+                if done:
                     break
 
-            # Decay epsilon
-            worker.decay_epsilon()
+            if sim == evaluate_after:
+                eval_rewards.append(cumulative_reward)
+                eval_acceptances.extend(acceptances)
 
-        # Bin wage offers and calculate acceptance rates
-        wage_bins = np.linspace(env.wage_min, env.wage_max, 20)
-        bin_indices = np.digitize(wage_offers, wage_bins, right=True)
-        acceptance_rates = np.zeros(len(wage_bins) - 1)
+        # Process evaluation data only
+        num_bins = 10
+        wage_bins = np.linspace(env.wage_min, env.wage_max, num_bins + 1)
+        wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
 
-        for i in range(1, len(wage_bins)):
-            bin_acceptances = [acceptances[j] for j in range(len(bin_indices)) if bin_indices[j] == i]
-            acceptance_rates[i - 1] = np.mean(bin_acceptances) if bin_acceptances else 0
+        acceptance_counts = np.zeros(num_bins)
+        offer_counts = np.zeros_like(acceptance_counts)
 
-        return wage_bins, acceptance_rates, worker.q_table
-    
+        eval_wage_offers = all_wage_offers[-len(eval_acceptances):]
+        for offer, accept in zip(eval_wage_offers, eval_acceptances):
+            bin_idx = np.digitize(np.round(offer, 2), np.round(wage_bins, 2)) - 1
+            if 0 <= bin_idx < num_bins:
+                offer_counts[bin_idx] += 1
+                acceptance_counts[bin_idx] += accept
+
+        eval_acceptance_rates = np.divide(
+            acceptance_counts,
+            offer_counts,
+            out=np.zeros_like(acceptance_counts, dtype=float),
+            where=offer_counts != 0
+        )
+
+        # Return evaluation-only results
+        return eval_rewards, eval_acceptance_rates, worker.q_table
+
     elif env.firm_only_mode:
         firm = agent
         total_firm_offers = np.zeros(firm.n_wage_levels)  # Track total offers by firm
         accepted_firm_offers = np.zeros_like(total_firm_offers)  # Track accepted offers
-        acceptance_rates = np.zeros_like(total_firm_offers)
 
         for episode in range(n_episodes):
             env.reset()  # Reset environment for each episode
@@ -409,6 +470,33 @@ def simulate(env, n_episodes, agent):
         raise ValueError("Invalid mode")
 
 # %%
+def evaluate(env, agent, timesteps = 100):
+    # Reset environment and agent state
+    env.reset()
+    
+    simulations = 50
+
+    acceptance_log = []  # Track all offers and decisions
+    for j in range(simulations):
+        wage_offers = np.linspace(env.wage_min, env.wage_max, 100)
+        np.random.shuffle(wage_offers)
+        for i in range(timesteps):
+            wage_offer = wage_offers[i]
+            state = agent.get_state(wage_offer, env)
+
+            # Use learned policy (no exploration)
+            action = 1 if wage_offer >= env.reservation_wage else 0
+
+            # Record decision
+            acceptance_log.append((wage_offer, action))
+
+            if action == 1:
+                print(f"Accepted Wage Offer: {wage_offer} at Timestep {i}")
+                break  # Stop once the agent accepts a wage (as per theory)
+
+    return acceptance_log
+
+# %%
 # Environment setup
 worker_only_env = McCallModelEnv(worker_only_mode=True)
 firm_only_env = McCallModelEnv(firm_only_mode=True, p_exit=0.02)
@@ -420,12 +508,15 @@ firm = FirmAgent(n_states=40, n_wage_levels=20)
 worker = WorkerAgent(n_states=150, n_actions=2, use_age_based=False)
 
 # Number of episodes
-n_episodes = 150000
+n_episodes = 200
 
 # -- simulations --
 
 # worker only
-wage_bins, worker_only_acceptance_rates, worker_q_table = simulate(worker_only_env, n_episodes, agent=worker)
+wage_bins, eval_acceptance_rates, worker_q_table = simulate(worker_only_env, n_episodes, agent=worker)
+eval_results = evaluate(worker_only_env, worker)
+eval_wage_offers = [offer for offer, action in eval_results]
+eval_acceptances = [action for offer, action in eval_results]
 
 # firm only
 total_offers, accepted_offers, acceptance_rates = simulate(firm_only_env, n_episodes, firm)
@@ -436,25 +527,49 @@ firm_offers, worker_accepts, acceptance_rates, firm_profits = simulate(random_en
 age_based_results = simulate(age_based_env, n_episodes, agent=firm)
 
 # %%
-# Calculate midpoints of the wage bins for plotting
+# Define finer bins with better alignment
+num_bins = 50
+wage_bins = np.linspace(worker_only_env.wage_min, worker_only_env.wage_max + 1e-5, num_bins + 1)
 wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
 
-# Plotting
-fig, ax = plt.subplots(figsize=(6, 4))
+# Process acceptance data
+acceptance_counts = np.zeros(num_bins)
+offer_counts = np.zeros_like(acceptance_counts)
 
-# Bar plot
-ax.bar(wage_bin_midpoints, worker_only_acceptance_rates, width=5.0, color='blue', alpha=1.0, label='Acceptance Rates')
+for offer, accept in zip(eval_wage_offers, eval_acceptances):
+    bin_idx = np.digitize(offer, wage_bins) - 1
+    if 0 <= bin_idx < num_bins:
+        offer_counts[bin_idx] += 1
+        acceptance_counts[bin_idx] += accept
 
-# Add the reservation wage line
-reservation_wage = worker_only_env.reservation_wage
-ax.axvline(reservation_wage, color='green', linestyle='--', linewidth=2, label='Reservation Wage')
+# Calculate acceptance rates
+eval_acceptance_rates = np.divide(
+    acceptance_counts,
+    offer_counts,
+    out=np.zeros_like(acceptance_counts, dtype=float),
+    where=offer_counts != 0
+)
 
-# Set titles and labels
-ax.set_title("Worker Acceptance Rates")
-ax.set_xlabel("Wage Offered")
-ax.set_ylabel("Acceptance Rate")
-ax.legend()
+# Debugging outputs
+# print(f"Wage Bin Midpoints: {wage_bin_midpoints}")
+# print(f"Eval Acceptance Rates: {eval_acceptance_rates}")
 
+# Plot with thinner bars
+plt.figure(figsize=(6, 4))
+bar_width = (wage_bins[1] - wage_bins[0]) * 0.4  # Adjust for thinner bars
+plt.bar(
+    wage_bin_midpoints, 
+    eval_acceptance_rates, 
+    width=bar_width, 
+    color='green', 
+    alpha=0.8, 
+    label='Worker Acceptance Rates'
+)
+plt.axvline(worker_only_env.reservation_wage, color='blue', linestyle='--', label='Reservation Wage')
+plt.title('Worker Acceptance Rates')
+plt.xlabel('Wage Offered')
+plt.ylabel('Acceptance Rate')
+plt.legend()
 plt.tight_layout()
 plt.show()
 
@@ -466,7 +581,7 @@ wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
 
 fig, ax = plt.subplots(figsize=(6, 4))
 ax.bar(wage_bin_midpoints, total_offers, color='blue', alpha=0.7, label='Total Firm Offers')
-ax.set_title('Firm Wage Offer Frequency (Base Case)')
+ax.set_title('Firm Wage Offer Frequency')
 ax.set_xlabel('Wage Offered')
 ax.set_ylabel('Frequency')
 ax.legend()
@@ -491,7 +606,7 @@ plt.show()
 # Plot acceptance rates
 fig, ax = plt.subplots(figsize=(6, 4))
 ax.bar(wage_bin_midpoints, acceptance_rates, color='green', alpha=0.7, label='Worker Acceptance Rates')
-ax.set_title('Worker Acceptance Rates by Wage Offer')
+ax.set_title('Worker Acceptance Rates')
 ax.set_xlabel('Wage Offered')
 ax.set_ylabel('Acceptance Rate')
 ax.legend()
