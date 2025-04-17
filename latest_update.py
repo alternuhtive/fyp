@@ -1,5 +1,6 @@
 # %%
 import numpy as np
+import copy
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
@@ -47,6 +48,11 @@ class DQNWorkerAgent:
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
 
+        # 0416: adding target network for stability
+        self.target_net = copy.deepcopy(self.q_network)
+        self.target_update_freq = 500  # update target network every 1000 steps
+        
+
     def store_transition(self, state, action, reward, next_state, done):
         # state and next_state are lists or numpy arrays of length state_dim.
         self.memory.append((state, action, reward, next_state, done))
@@ -80,7 +86,12 @@ class DQNWorkerAgent:
 
         # compute next Q-values
         with torch.no_grad():
-            next_q = self.q_network(next_states_t).max(dim=1)[0]
+            # next_q = self.q_network(next_states_t).max(dim=1)[0]
+            # 0416: using target network for next Q-value
+            next_q = self.target_net(next_states_t).max(dim=1)[0]
+            # 0416: updating target network
+            if self.target_update_freq % 500 == 0:
+                self.target_net.load_state_dict(self.q_network.state_dict())
 
         # target Q-value
         target_q = rewards_t + (1 - done_t) * self.gamma * next_q
@@ -92,6 +103,8 @@ class DQNWorkerAgent:
         # backpropagation and optimization
         self.optimizer.zero_grad()
         loss.backward()
+        # 0416: gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         # Decay epsilon after each update
@@ -250,7 +263,7 @@ class McCallModelEnv:
                     else:
                         reward_raw = wage_offer * (T - t)
                     # new feature: age scaling
-                    age_scaling = 0.1 + 0.9 * ((self.current_age - self.age_start) / (self.age_retire - self.age_start))
+                    age_scaling = 0.8 + 0.2 * ((self.current_age - self.age_start) / (self.age_retire - self.age_start))
                     reward = reward_raw * age_scaling
                     self.done = True
                 else:
@@ -285,11 +298,16 @@ class McCallModelEnv:
 
                     # new reward func
                     if self.gamma != 1:
-                        worker_reward = wage_offer * (1 - self.gamma**(T - t)) / (1 - self.gamma)
+                        worker_reward_raw = wage_offer * (1 - self.gamma**(T - t)) / (1 - self.gamma)
                     else:
-                        worker_reward = wage_offer * (T - t)
+                        worker_reward_raw = wage_offer * (T - t)
 
                     firm_reward = self.value_match - wage_offer
+
+                    # new feature: age scaling
+                    age_scaling = 0.5 + 0.5 * ((self.current_age - self.age_start) / (self.age_retire - self.age_start))
+                    worker_reward = worker_reward_raw * age_scaling
+
                     self.done = True
                     action = 1
 
@@ -394,12 +412,6 @@ class McCallModelEnv:
             for t in range(T-1, -1, -1):
                 wait_value = -self.unemployment_penalty + self.gamma * V[t+1]
                 if mode == "worker":
-                    # Use the same exponential factor as in env.step
-                    # accept_reward = wage_values * (1 - np.exp(-(T - t))) / (1 - np.exp(-1))
-                    # apply smoothing
-
-                    # old reward func
-                    # accept_reward = wage_values * (1 - np.exp(-beta*(T - t))) / (1 - np.exp(-beta))
 
                     # new reward func
                     if self.gamma != 1:
@@ -545,9 +557,9 @@ def simulate(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
                             # (env.current_age - env.age_start) / (env.age_retire - env.age_start)]
                     
                     # new
-                    remaining = (env.age_retire - env.current_age) / (env.age_retire - env.age_start)
+                    remaining = ((env.age_retire - env.current_age) / (env.age_retire - env.age_start))
                     state = [wage_offer / env.wage_max,
-                            (env.current_age - env.age_start) / (env.age_retire - env.age_start),
+                            ((env.current_age - env.age_start) / (env.age_retire - env.age_start)),
                             remaining]
 
 
@@ -562,9 +574,9 @@ def simulate(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
                     # Build the next state.
                     if not done:
                         new_age = env.current_age
-                        new_remaining = (env.age_retire - new_age) / (env.age_retire - env.age_start)
+                        new_remaining = ((env.age_retire - new_age) / (env.age_retire - env.age_start))
                         next_state = [wage_offer / env.wage_max,
-                                    (new_age - env.age_start) / (env.age_retire - env.age_start),
+                                    ((new_age - env.age_start) / (env.age_retire - env.age_start)),
                                     new_remaining]
                     else:
                         next_state = [0.0, 0.0, 0.0]
@@ -578,8 +590,12 @@ def simulate(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
                     #     worker.train_step()
                     
                     # Record the environment’s reservation wage at the current age
-                    recorded_rw[episode, age_index] = env.res_wage_table[env.current_age]
-                    
+                    if env.current_age < env.age_retire:
+                        recorded_rw[episode, age_index] = env.res_wage_table[env.current_age]
+                    else:
+                        # If current_age reached or exceeded age_retire, mark as done.
+                        done = True
+
                     if not done:
                         env.current_age = new_age
                         if env.current_age < env.age_retire:
@@ -824,7 +840,7 @@ def simulate(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
         raise ValueError("Invalid mode")
 
 # %%
-def compute_reservation_wage_by_age_eval(worker_agent, env, wage_points=100):
+def compute_learned_res_wage(worker_agent, env, wage_points=100):
     """
     Evaluate the worker's trained DQN policy by checking the lowest wage they accept at each age.
     """
@@ -841,7 +857,8 @@ def compute_reservation_wage_by_age_eval(worker_agent, env, wage_points=100):
         found_accept = False
         
         for w in wages:
-            state = [w / env.wage_max, (age - env.age_start) / (env.age_retire - env.age_start)]
+            remaining = ((env.age_retire - age) / (env.age_retire - env.age_start)) 
+            state = [w / env.wage_max, (age - env.age_start) / (env.age_retire - env.age_start), remaining]
             state_t = torch.FloatTensor(state).unsqueeze(0)
             q_values = worker_agent.q_network(state_t)
             action = torch.argmax(q_values, dim=1).item()
@@ -886,10 +903,10 @@ def simulate_age_based(env, n_episodes, firm_agent, worker_agent, timesteps=100)
             wage_offer = env.wage_min + action_index * (env.wage_max - env.wage_min) / (firm_agent.n_wage_levels - 1)
 
             # worker picks action
-            remaining = (env.age_retire - env.current_age) / (env.age_retire - env.age_start)
+            remaining = ((env.age_retire - env.current_age) / (env.age_retire - env.age_start))
             worker_state = [
                 wage_offer / env.wage_max,
-                (env.current_age - env.age_start) / (env.age_retire - env.age_start),
+                ((env.current_age - env.age_start) / (env.age_retire - env.age_start)),
                 remaining
             ]
 
@@ -897,12 +914,6 @@ def simulate_age_based(env, n_episodes, firm_agent, worker_agent, timesteps=100)
 
             # step environment
             firm_reward, worker_reward, done, worker_action = env.step(wage_offer, worker_accept=worker_action)
-
-            # debugging
-            # print(
-            #     f"Gamma={env.gamma}, Episode={episode}, Step={t}, Age={env.current_age}, WageOffer={wage_offer:.2f}, "
-            #     f"FirmReward={firm_reward:.2f}, WorkerAccepted={worker_action}, Done={done}"
-            #     )
 
             # record for plotting
             age_wage_data.append((env.current_age, wage_offer))
@@ -912,10 +923,10 @@ def simulate_age_based(env, n_episodes, firm_agent, worker_agent, timesteps=100)
             if not done:
                 next_firm_state = [(env.current_age - env.age_start) / (env.age_retire - env.age_start)]
 
-                new_remaining = (env.age_retire - env.current_age) / (env.age_retire - env.age_start)
+                new_remaining = ((env.age_retire - env.current_age) / (env.age_retire - env.age_start))
                 next_worker_state = [
                     wage_offer / env.wage_max,
-                    (env.current_age - env.age_start) / (env.age_retire - env.age_start),
+                    ((env.current_age - env.age_start) / (env.age_retire - env.age_start)),
                     new_remaining
                 ]
 
@@ -978,34 +989,41 @@ def evaluate(env, agent, mode, timesteps, simulations):
 
 # %%
 def evaluate_policy_over_ages(worker_agent, env, wage_points=100):
-    
+    """
+    Evaluate the worker's trained DQN policy by checking the lowest wage they accept at each age.
+    """
     ages = np.arange(env.age_start, env.age_retire)
     reservation_wages = []
     
     # Create a grid of possible wage offers.
     wage_grid = np.linspace(1, env.wage_max, wage_points)
     print(f"wage_grid: {wage_grid}")
+    
     for age in ages:
         found_reservation = env.wage_max  # default to max if no acceptance is found
+        # Calculate normalized age and remaining time once for the current age.
+        # rescaled for better variation
+        norm_age = ((age - env.age_start) / (env.age_retire - env.age_start))
+        remaining = ((env.age_retire - age) / (env.age_retire - env.age_start))
+        
         for wage in wage_grid:
             norm_wage = wage / env.wage_max
-            norm_age = (age - env.age_start) / (env.age_retire - env.age_start)
-            state = [norm_wage, norm_age]
+            # Now the state has 3 elements: normalized wage, normalized age, and remaining time.
+            state = [norm_wage, norm_age, remaining]
             state_t = torch.FloatTensor(state).unsqueeze(0)
-            
-            # Query the worker's Q-network.
             q_values = worker_agent.q_network(state_t)
             action = torch.argmax(q_values, dim=1).item()
 
-            # debugging
+            # Debugging print
             print(f"Age {age}, Wage {wage:.2f}, Q-values: {q_values.detach().numpy()}, Action: {action}")
             
-            # If action 1 (accept) is chosen, record that wage as reservation.
-            if action == 1:
+            if action == 1:  # Accept
                 found_reservation = wage
                 break
+        
         reservation_wages.append(found_reservation)
     return ages, reservation_wages
+
 
 # %%
 def normalize_age(age_start, age_retire, age_wage_data, portion = 0.2):
@@ -1034,7 +1052,7 @@ def normalize_age(age_start, age_retire, age_wage_data, portion = 0.2):
     sum_wages = np.zeros(age_span)
     count_wages = np.zeros(age_span)
 
-    for (age, wage) in age_wage_data:
+    for (age, wage) in filtered_data:
         idx = age - age_start
         if 0 <= idx < age_span:
             sum_wages[idx] += wage
@@ -1067,7 +1085,7 @@ def average_by_age(accepted_dict):
 
 # %%
 # Number of episodes
-n_episodes = 100
+n_episodes = 21000
 
 # %%
 # --- Simulate age-based environment with different gamma values ---
@@ -1092,7 +1110,7 @@ worker_agent_low = DQNWorkerAgent(
     state_dim=3,   # [normalized wage, normalized age]
     action_dim=2,  # accept or reject
     gamma=0.01,
-    lr=1e-3
+    lr=2e-3
 )
 
 # high gamma
@@ -1116,7 +1134,7 @@ worker_agent_high = DQNWorkerAgent(
     state_dim=3,   # [normalized wage, normalized age]
     action_dim=2,  # accept or reject
     gamma=0.9999,
-    lr=1e-3
+    lr=2e-3
 )
 
 # simulation
@@ -1134,13 +1152,13 @@ age_wage_data_high, acceptance_data_high = simulate_age_based(
     worker_agent_high
     )
 # normalize ages for plot
-ages_low, avg_offers_by_age_low = normalize_age(
+norm_ages_low, avg_offers_by_age_low = normalize_age(
     env_age_low.age_start, 
     env_age_low.age_retire, 
     age_wage_data_low
     )
 
-ages_high, avg_offers_by_age_high = normalize_age(
+norm_ages_high, avg_offers_by_age_high = normalize_age(
     env_age_high.age_start, 
     env_age_high.age_retire, 
     age_wage_data_high
@@ -1148,15 +1166,30 @@ ages_high, avg_offers_by_age_high = normalize_age(
 
 # %%
 # age based worker only but with evaluation - interaction mode
-ages_low, res_wages_low = evaluate_policy_over_ages(worker_agent_low, env_age_low, wage_points=100)
-ages_high, res_wages_high = evaluate_policy_over_ages(worker_agent_high, env_age_high, wage_points=100)
+# eval_ages_low, res_wages_low = evaluate_policy_over_ages(worker_agent_low, env_age_low, wage_points=100)
+# eval_ages_high, res_wages_high = evaluate_policy_over_ages(worker_agent_high, env_age_high, wage_points=100)
+
+eval_ages_low,  res_wages_low  = compute_learned_res_wage(worker_agent_low,  env_age_low)
+eval_ages_high, res_wages_high = compute_learned_res_wage(worker_agent_high, env_age_high)
 
 plt.figure(figsize=(8,5))
-plt.plot(ages_low, res_wages_low, marker='o', label='Low Gamma (0.01)')
-plt.plot(ages_high, res_wages_high, marker='o', label='High Gamma (0.9999)')
+plt.plot(eval_ages_low, res_wages_low, marker='o', label='Low Gamma (0.01)')
+plt.plot(eval_ages_high, res_wages_high, marker='o', label='High Gamma (0.9999)')
 plt.xlabel("Worker Age")
 plt.ylabel("Reservation Wage")
 plt.title("Worker Reservation Wage vs. Age (Interaction)")
+plt.legend()
+plt.show()
+
+# %%
+# firm side in age-based firm-worker interaction
+
+plt.figure(figsize=(7,5))
+plt.plot(norm_ages_low, avg_offers_by_age_low, marker='o', label='Low Gamma (0.01)')
+plt.plot(norm_ages_high, avg_offers_by_age_high, marker='o', label='High Gamma (0.9999)')
+plt.xlabel("Worker Age")
+plt.ylabel("Average Firm Wage Offer")
+plt.title("Firm Wage Offers vs. Age (Interaction)")
 plt.legend()
 plt.show()
 
@@ -1184,22 +1217,10 @@ ages_high, res_wages_high = evaluate_policy_over_ages(worker_high, age_based_env
 
 plt.figure(figsize=(8,5))
 plt.plot(ages_low, res_wages_low, marker='o', label='Low Gamma (0.01)')
-plt.plot(ages_high, res_wages_high, marker='o', label='High Gamma (0.9999)')
+plt.plot(ages_high, res_wages_high, marker='o', label='High Gamma (0.999)')
 plt.xlabel("Worker Age")
 plt.ylabel("Reservation Wage")
 plt.title("Worker Reservation Wage vs. Age")
-plt.legend()
-plt.show()
-
-# %%
-# firm side in age-based firm-worker interaction
-
-plt.figure(figsize=(7,5))
-plt.plot(ages_low, avg_offers_by_age_low, marker='o', label='Low Gamma (0.01)')
-plt.plot(ages_high, avg_offers_by_age_high, marker='o', label='High Gamma (0.9999)')
-plt.xlabel("Worker Age")
-plt.ylabel("Average Firm Wage Offer")
-plt.title("Firm Wage Offers vs. Age (Interaction)")
 plt.legend()
 plt.show()
 
