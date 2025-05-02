@@ -66,9 +66,8 @@ class DQNWorkerAgent:
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
 
-        # 0416: adding target network for stability
         self.target_net = copy.deepcopy(self.q_network)
-        self.target_update_freq = 500  # update target network every 1000 steps
+        self.target_update_freq = 500  
         self.learn_steps = 0
         
 
@@ -163,7 +162,7 @@ class DQNFirmAgent:
 
     def train_step(self):
         if len(self.memory) < self.batch_size:
-            return  # Not enough samples to train.
+            return  
         batch = random.sample(self.memory, self.batch_size)
         states, actions, rewards, next_states, done = zip(*batch)
         states_t = torch.FloatTensor(states)       # [batch_size, state_dim]
@@ -177,17 +176,21 @@ class DQNFirmAgent:
         self.learn_steps += 1
 
         with torch.no_grad():
-            next_q = self.q_network(next_states_t).max(dim=1)[0]
+            next_q = self.target_net(next_states_t).max(dim=1)[0]
             if self.learn_steps % self.target_update_freq == 0:
                 self.target_net.load_state_dict(self.q_network.state_dict())
+
         target_q = rewards_t + (1 - done_t) * self.gamma * next_q
         
         loss = self.loss_fn(current_q, target_q)
+        
         self.optimizer.zero_grad()
         loss.backward()
+        # gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=1.0)
+        
         self.optimizer.step()
         
-        # Decay epsilon after each update.
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
 # %% [markdown]
@@ -411,7 +414,7 @@ class McCallModelEnv:
                 reward_raw = wage_offer * (1 - self.gamma**(T - t)) / (1 - self.gamma)
             else:
                 reward_raw = wage_offer * (T - t)
-            # new feature: age scaling
+
             age_scaling = 0.8 + 0.2 * ((self.current_age - self.age_start) / (self.age_retire - self.age_start))
             reward = reward_raw * age_scaling
             self.done = True
@@ -472,8 +475,7 @@ class McCallModelEnv:
 
         else:
             firm_reward = -self.unemployment_penalty
-            cont_value = self.res_wage_table[self.current_age] * (1 - self.gamma**(T - t)) / (1 - self.gamma)
-            worker_reward = -self.unemployment_penalty + cont_value
+            worker_reward = -self.unemployment_penalty
             self.done = False
             action = 0
 
@@ -534,14 +536,11 @@ class McCallModelEnv:
                     accept_values = np.maximum(accept_reward, wait_value)
                 expected_value = np.sum(p * accept_values)
                 V[t] = expected_value
-            # Define the reservation wage at this age (using the indifference condition)
-            # res_table[age] = wait_value if T >= 1 else 0.0
             
             valid_indices = np.where(accept_reward >= wait_value)[0]
             if len(valid_indices) > 0:
                 res_wage_for_age = wage_values[valid_indices[0]]
             else:
-                # If none of them exceed wait_value, then the reservation wage might be the max wage
                 res_wage_for_age = wage_values[-1]
 
             res_table[age] = res_wage_for_age
@@ -552,14 +551,14 @@ class McCallModelEnv:
 # # 6. Simulations
 
 # %%
-def simulate(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
+def simulate(env, n_episodes, agent=None, firm_agent=None, worker_agent=None, evaluate_after=20, timesteps_per_sim=100):
     if env.age_based_mode:
         if env.worker_only_mode:
             return simulate_age_based_worker(env, n_episodes, agent)
         elif env.firm_only_mode:
             return simulate_age_based_firm(env, n_episodes, agent)
         else:
-            return simulate_age_based_interaction(env, n_episodes, agent)
+            return simulate_age_based(env, n_episodes, firm_agent, worker_agent)
 
     elif env.worker_only_mode:
         return simulate_worker_only(env, n_episodes, agent, evaluate_after, timesteps_per_sim)
@@ -569,7 +568,7 @@ def simulate(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
 
     # firm and worker interaction
     elif env.random_mode:
-        return simulate_interaction(env, n_episodes, agent)
+        return simulate_interaction(env, n_episodes, firm_agent=firm, worker_agent=worker)
 
     else:
         raise ValueError("Invalid mode")
@@ -580,8 +579,9 @@ def simulate_age_based_worker(env, n_episodes, agent):
     num_age_steps = env.age_retire - env.age_start
     age_offer_data = []
     acceptance_data = []
-    # For plotting, we record the environment’s computed reservation wage per age
     recorded_rw = np.zeros((n_episodes, num_age_steps))
+
+    worker_returns = []
     
     for episode in range(n_episodes):
         env.current_age = env.reset()  # env.reset() returns a random starting age in [age_start, age_retire)
@@ -589,8 +589,10 @@ def simulate_age_based_worker(env, n_episodes, agent):
         age_index = env.current_age - env.age_start
         step_count = 0
 
+        total_reward = 0
+
         while not done:
-            # Firm offers a wage from a Gaussian (firms do not learn)
+            # firm offers a wage from a Gaussian (firms do not learn)
             base = env.res_wage_table[env.current_age]
             wage_offer = np.random.normal(loc=base, scale=(env.wage_max - env.wage_min)*0.1)
             wage_offer = np.clip(wage_offer, env.wage_min, env.wage_max)
@@ -600,15 +602,17 @@ def simulate_age_based_worker(env, n_episodes, agent):
                     ((env.current_age - env.age_start) / (env.age_retire - env.age_start)),
                     remaining]
 
-            # Agent selects action: 0 = reject, 1 = accept
+            # agent selects action: 0 = reject, 1 = accept
             action = worker.select_action(state)
             
-            # Step the environment with the current wage offer
+            # step the environment with the current wage offer
             worker_reward, done, env_action = env.step(wage_offer, worker_accept=action)
             age_offer_data.append((env.current_age, wage_offer))
             acceptance_data.append(env_action)
 
-            # Build the next state.
+            total_reward += worker_reward
+
+            # build the next state.
             if not done:
                 new_age = env.current_age
                 new_remaining = ((env.age_retire - new_age) / (env.age_retire - env.age_start))
@@ -618,15 +622,15 @@ def simulate_age_based_worker(env, n_episodes, agent):
             else:
                 next_state = [0.0, 0.0, 0.0]
             
-            # Store the transition in the agent’s memory.
+            # store the transition in the agent’s memory
             worker.store_transition(state, action, worker_reward, next_state, done)
             worker.train_step()
             
-            # Record the environment’s reservation wage at the current age
+            # record the environment’s reservation wage at the current age
             if env.current_age < env.age_retire:
                 recorded_rw[episode, age_index] = env.res_wage_table[env.current_age]
             else:
-                # If current_age reached or exceeded age_retire, mark as done.
+                # if current_age reached or exceeded age_retire, mark as done
                 done = True
 
             if not done:
@@ -635,70 +639,74 @@ def simulate_age_based_worker(env, n_episodes, agent):
                     age_index =env.current_age - env.age_start
                 else:
                     done = True
-                    
-    # Return the recorded reservation wages for plotting.
-    return recorded_rw, age_offer_data, acceptance_data
+        worker_returns.append(total_reward)                
+    return recorded_rw, age_offer_data, acceptance_data, worker_returns
 
 # %%
 def simulate_age_based_firm(env, n_episodes, agent):
     firm = agent  
-    total_offers = []    # Record all wage offers made
-    eval_acceptances = []  # Record wage offer indices that lead to acceptance
-    age_offer_data = []  # Record the age and wage offer for each episode
+    total_offers = []    
+    eval_acceptances = []  
+    age_offer_data = []  
     timesteps_per_sim = env.age_retire - env.age_start
+
+    firm_returns = []
     
-    # Run simulation over episodes.
     for sim in range(n_episodes):
-        env.reset()  # In age-based mode, reset() sets current_age = age_start and precomputes reservation wage table
+        env.reset()  
         done = False
-        # In age-based mode, the state for the firm is the worker's normalized age.
+        
+        total_reward = 0
+
         state = [(env.current_age - env.age_start) / (env.age_retire - env.age_start)]
         
         for t in range(timesteps_per_sim):
             if done:
                 break
                 
-            # Firm selects an action using its DQN (action index in {0,..., n_wage_levels-1})
             action_index = firm.select_action(state)
             
-            # Map the action index to a wage offer.
-            # For example, if there are n_wage_levels discrete wage offers:
+            # map the action index to a wage offer
             wage_offer = env.wage_min + action_index * (env.wage_max - env.wage_min) / (firm.n_wage_levels - 1)
             total_offers.append(wage_offer)
 
             age_offer_data.append((env.current_age, wage_offer))
             
-            # Step the environment in age-based mode.
-            # In age-based mode, env.step(wage_offer) returns (firm_profit, worker_reward, done, acceptance)
+            # step the environment in age-based mode
             firm_reward, done, acceptance = env.step(wage_offer)
+            total_reward += firm_reward
 
-            # Define next state: update the worker's normalized age.
+            # define next state: update the worker's normalized age
             next_state = ([(env.current_age - env.age_start) / (env.age_retire - env.age_start)]
                         if not done else [0.0])
             d = 1.0 if done else 0.0
             
-            # Store the transition and perform training.
             firm.store_transition(state, action_index, firm_reward, next_state, d)
             firm.train_step()
             
-            # Record acceptance if worker accepts.
             if acceptance == 1:
                 eval_acceptances.append(action_index)
             
-            # Update state for next timestep.
             state = next_state
         
-    return total_offers, eval_acceptances, firm.q_network, age_offer_data
+        firm_returns.append(total_reward)
+        
+    return total_offers, eval_acceptances, firm.q_network, age_offer_data, firm_returns
 
 # %%
 def simulate_age_based(env, n_episodes, firm_agent, worker_agent):
     age_wage_data = []
     acceptance_data = []
+    firm_episode_returns = []
+    worker_episode_returns = []
+
     timesteps = env.age_retire - env.age_start
 
     for episode in range(n_episodes):
         env.current_age = env.reset()
         done = False
+        firm_total_reward = 0
+        worker_total_reward = 0
 
         # build state for firm (normalized age)
         firm_state = [(env.current_age - env.age_start) / (env.age_retire - env.age_start)]
@@ -728,6 +736,9 @@ def simulate_age_based(env, n_episodes, firm_agent, worker_agent):
             age_wage_data.append((env.current_age, wage_offer))
             acceptance_data.append(worker_action)
 
+            firm_total_reward += firm_reward
+            worker_total_reward += worker_reward
+
             # build next state
             if not done:
                 next_firm_state = [(env.current_age - env.age_start) / (env.age_retire - env.age_start)]
@@ -754,19 +765,24 @@ def simulate_age_based(env, n_episodes, firm_agent, worker_agent):
 
             # update state
             firm_state = next_firm_state
+    
+        firm_episode_returns.append(firm_total_reward)
+        worker_episode_returns.append(worker_total_reward)
 
-    return age_wage_data, acceptance_data
+    return age_wage_data, acceptance_data, firm_episode_returns, worker_episode_returns
 
 # %%
 def simulate_worker_only(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
     worker = agent
+    episode_returns = []
+
     eval_rewards = []
     eval_acceptances = []
 
     all_wage_offers = []
     all_acceptances = []
 
-    for sim in range(evaluate_after + 1):
+    for sim in range(n_episodes):
         env.reset()
         cumulative_reward = 0
         acceptances = []
@@ -780,7 +796,6 @@ def simulate_worker_only(env, n_episodes, agent, evaluate_after=20, timesteps_pe
             wage_offer = wage_offers[i]
             state = worker.get_state(wage_offer, env)
 
-            # Enforce acceptance above reservation wage during evaluation
             if sim >= evaluate_after and wage_offer >= env.reservation_wage:
                 action_taken = 1
             else:
@@ -798,20 +813,21 @@ def simulate_worker_only(env, n_episodes, agent, evaluate_after=20, timesteps_pe
 
             if done:
                 break
-
+            
+        episode_returns.append(cumulative_reward)
+        
         if sim == evaluate_after:
             eval_rewards.append(cumulative_reward)
             eval_acceptances.extend(acceptances)
 
-    # Process evaluation data only
+
     num_bins = 10
     wage_bins = np.linspace(env.wage_min, env.wage_max, num_bins + 1)
-    wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
 
     acceptance_counts = np.zeros(num_bins)
     offer_counts = np.zeros_like(acceptance_counts)
-
     eval_wage_offers = all_wage_offers[-len(eval_acceptances):]
+
     for offer, accept in zip(eval_wage_offers, eval_acceptances):
         bin_idx = np.digitize(np.round(offer, 2), np.round(wage_bins, 2)) - 1
         if 0 <= bin_idx < num_bins:
@@ -825,44 +841,47 @@ def simulate_worker_only(env, n_episodes, agent, evaluate_after=20, timesteps_pe
         where=offer_counts != 0
     )
 
-    # Return evaluation-only results
-    return eval_rewards, eval_acceptance_rates, worker.q_table
+    return eval_rewards, eval_acceptance_rates, worker.q_table, episode_returns
 
 # %%
 def simulate_firm_only(env, n_episodes, agent, evaluate_after=20, timesteps_per_sim=100):
     firm = agent
-    eval_acceptances = []  # Track acceptances during evaluation
-    total_offers = []      # Track all offers
+    eval_acceptances = []  
+    total_offers = []     
+    episode_returns = []  
 
-    for sim in range(evaluate_after + 1):  # Split into training and evaluation
+    for sim in range(n_episodes): 
         env.reset()
-        firm_offers = np.zeros(firm.n_wage_levels)  # Track total offers by firm
+        cumulative_reward = 0
+        firm_offers = np.zeros(firm.n_wage_levels)  
         accepted_firm_offers = np.zeros_like(firm_offers)
 
         for t in range(timesteps_per_sim):
-            state = 0  # Firm logic uses a single state for simplicity
+            state = 0  
             action_index = firm.choose_action(state, sim, n_episodes)
 
-            # Convert action index to a wage offer
             wage_offer = env.wage_min + action_index * (env.wage_max - env.wage_min) / firm.n_wage_levels
             total_offers.append(wage_offer)
 
-            # Step in environment
             firm_reward, done, action_taken = env.step(wage_offer)
+            cumulative_reward += firm_reward
 
-            if sim < evaluate_after:  # Training phase
+            if sim < evaluate_after:  
                 firm.update_q_table(state, action_index, firm_reward, state, done)
+                
 
-            if action_taken == 1:  # Worker accepted the offer
+
+            if action_taken == 1:  
                 accepted_firm_offers[action_index] += 1
 
-            if done:  # Stop if worker exits
+            if done:  
                 break
 
-        if sim >= evaluate_after:  # Record evaluation data
+        if sim >= evaluate_after:  
             eval_acceptances.extend(accepted_firm_offers)
+            
+        episode_returns.append(cumulative_reward)
 
-    # Process evaluation data for plotting
     wage_bins = np.linspace(env.wage_min, env.wage_max, firm.n_wage_levels + 1)
     wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
     offer_counts = np.histogram(total_offers, bins=wage_bins)[0]
@@ -878,25 +897,27 @@ def simulate_firm_only(env, n_episodes, agent, evaluate_after=20, timesteps_per_
         where=offer_counts != 0
     )
 
-    # Return evaluation results
-    return total_offers, eval_acceptance_rates, firm.q_table
+    return total_offers, eval_acceptance_rates, firm.q_table, episode_returns
 
 # %%
-def simulate_interaction(env, n_episodes, agent):
-    firm = FirmAgent(n_states=40, n_wage_levels=20, epsilon=1.0, epsilon_decay=0.995)
-    worker = WorkerAgent(n_states=150, n_actions=2, use_age_based=False, epsilon=1.0, epsilon_decay=0.995)
+def simulate_interaction(env, n_episodes, firm_agent, worker_agent):
+    firm = firm_agent
+    worker = worker_agent
 
     firm_offers = np.zeros(firm.n_wage_levels)
     worker_accepts = np.zeros_like(firm_offers)
     firm_profits = []
+    firm_episode_returns = []
+    worker_episode_returns = []
 
     for episode in range(n_episodes):
         env.reset()
         done = False
         total_profit = 0
+        worker_total_reward = 0
+        firm_total_reward = 0
 
         while not done:
-            # Firm state logic
             firm_state = 0
             firm_action_index = firm.choose_action(firm_state, episode, n_episodes)
             wage_offer = env.wage_min + firm_action_index * (env.wage_max - env.wage_min) / firm.n_wage_levels
@@ -912,14 +933,17 @@ def simulate_interaction(env, n_episodes, agent):
                 action_taken = 1
                 done = True
             else:
-                worker_reward = -1  # Penalty for rejecting
-                firm_reward = -env.unemployment_penalty  # Firm penalty for rejection
+                worker_reward = -1  
+                firm_reward = -env.unemployment_penalty  
                 action_taken = 0
-                if np.random.rand() < env.p_exit:  # Worker exits
+                if np.random.rand() < env.p_exit:  
                     done = True
             
             firm_reward = env.value_match - wage_offer if action_taken == 1 else -env.unemployment_penalty
             worker_reward = wage_offer if action_taken == 1 else -env.unemployment_penalty
+
+            firm_total_reward += firm_reward
+            worker_total_reward += worker_reward
 
             next_firm_state = firm_state
             next_worker_state = worker_state
@@ -932,17 +956,18 @@ def simulate_interaction(env, n_episodes, agent):
                 total_profit += firm_reward
         
         firm_profits.append(total_profit)
+        firm_episode_returns.append(firm_total_reward)
+        worker_episode_returns.append(worker_total_reward)
     
     acceptance_rates = np.divide(worker_accepts, firm_offers, out=np.zeros_like(worker_accepts, dtype=float), where=firm_offers != 0)
 
-    return firm_offers, worker_accepts, acceptance_rates, firm_profits 
+    return firm_offers, worker_accepts, acceptance_rates, firm_profits, firm_episode_returns, worker_episode_returns
 
 # %% [markdown]
 # # 7. Evaluations
 
 # %%
 def evaluate(env, agent, mode, timesteps, simulations):
-    # Reset environment and agent state
     env.reset()
     
     eval_wage_offers = []
@@ -956,24 +981,20 @@ def evaluate(env, agent, mode, timesteps, simulations):
             wage_offer = wage_offers[i]
 
             if mode == "worker":
-                # Worker evaluates offer using learned policy
                 action = 1 if wage_offer >= env.reservation_wage else 0
             elif mode == "firm":
-                # Firm chooses a wage to offer based on policy
-                state = 0  # Firm has one state in base case
+                state = 0  
                 action = agent.choose_action(state, sim, simulations)
                 wage_offer = env.wage_min + action * (env.wage_max - env.wage_min) / agent.n_wage_levels
 
-                # Worker decides whether to accept the offer
                 action = 1 if wage_offer >= env.reservation_wage else 0
             else:
                 raise ValueError(f"Invalid mode: {mode}")
 
-            # Record the results
             eval_wage_offers.append(wage_offer)
             eval_acceptances.append(action)
 
-            if action == 1:  # Stop when an offer is accepted
+            if action == 1:  
                 break
 
     return eval_wage_offers, eval_acceptances
@@ -987,25 +1008,21 @@ def evaluate_policy_over_ages(worker_agent, env, wage_points=100):
     ages = np.arange(env.age_start, env.age_retire)
     reservation_wages = []
     
-    # Create a grid of possible wage offers.
     wage_grid = np.linspace(1, env.wage_max, wage_points)
     
     for age in ages:
         found_reservation = env.wage_max  # default to max if no acceptance is found
-        # Calculate normalized age and remaining time once for the current age.
-        # rescaled for better variation
         norm_age = ((age - env.age_start) / (env.age_retire - env.age_start))
         remaining = ((env.age_retire - age) / (env.age_retire - env.age_start))
         
         for wage in wage_grid:
             norm_wage = wage / env.wage_max
-            # Now the state has 3 elements: normalized wage, normalized age, and remaining time.
             state = [norm_wage, norm_age, remaining]
             state_t = torch.FloatTensor(state).unsqueeze(0)
             q_values = worker_agent.q_network(state_t)
             action = torch.argmax(q_values, dim=1).item()
 
-            if action == 1:  # Accept
+            if action == 1:  
                 found_reservation = wage
                 break
         
@@ -1016,7 +1033,7 @@ def evaluate_policy_over_ages(worker_agent, env, wage_points=100):
 # %%
 def evaluate_firm_policy_over_ages(firm_agent, env, n_wage_levels):
     """
-    For each age in the age‐based env, compute which discrete wage the firm would pick
+    For each age in the age-based env, compute which discrete wage the firm would pick
     by argmaxing its Q-network over the n_wage_levels actions.
     """
     ages = np.arange(env.age_start, env.age_retire)
@@ -1039,35 +1056,52 @@ def evaluate_firm_policy_over_ages(firm_agent, env, n_wage_levels):
 # # 8. Main Code
 
 # %%
-# Number of episodes
-n_episodes = 2000
+n_episodes = 1000
 
 # %%
-# # -------------------- AGE-BASED WORKER-ONLY MODE --------------------
+# -------------------- AGE-BASED WORKER-ONLY MODE --------------------
 
-# # age-based: low discount factor
-# age_based_env_low = McCallModelEnv(age_based_mode=True, worker_only_mode=True, firm_only_mode=False, gamma=0.01)
-# worker_low = DQNWorkerAgent(state_dim=3, action_dim=2, gamma=0.01)
-# results_low, age_offer_data_low, acceptance_data_low = simulate(age_based_env_low, n_episodes, agent=worker_low)
+# age-based: low discount factor
+age_based_env_low = McCallModelEnv(age_based_mode=True, worker_only_mode=True, firm_only_mode=False, gamma=0.01)
+worker_low = DQNWorkerAgent(state_dim=3, action_dim=2, gamma=0.01)
+results_low, age_offer_data_low, acceptance_data_low, worker_returns_low = simulate(age_based_env_low, n_episodes, agent=worker_low)
 
-# # age-based: high discount factor
-# age_based_env_high = McCallModelEnv(age_based_mode=True, worker_only_mode=True, firm_only_mode=False, gamma=0.9999)
-# worker_high = DQNWorkerAgent(state_dim=3, action_dim=2, gamma=0.9999)
-# results_high, age_offer_data_high, acceptance_data_high = simulate(age_based_env_high, n_episodes, agent=worker_high)
+# age-based: high discount factor
+age_based_env_high = McCallModelEnv(age_based_mode=True, worker_only_mode=True, firm_only_mode=False, gamma=0.9999)
+worker_high = DQNWorkerAgent(state_dim=3, action_dim=2, gamma=0.9999)
+results_high, age_offer_data_high, acceptance_data_high, worker_returns_high = simulate(age_based_env_high, n_episodes, agent=worker_high)
 
 # %%
-# # age based worker only but with evaluation
-# ages_low, res_wages_low = evaluate_policy_over_ages(worker_low, age_based_env_low, wage_points=100)
-# ages_high, res_wages_high = evaluate_policy_over_ages(worker_high, age_based_env_high, wage_points=100)
+ages_low, res_wages_low = evaluate_policy_over_ages(worker_low, age_based_env_low, wage_points=100)
+ages_high, res_wages_high = evaluate_policy_over_ages(worker_high, age_based_env_high, wage_points=100)
 
-# plt.figure(figsize=(8,5))
-# plt.plot(ages_low, res_wages_low, marker='o', label='Low Gamma (0.01)')
-# plt.plot(ages_high, res_wages_high, marker='o', label='High Gamma (0.9999)')
-# plt.xlabel("Worker Age")
-# plt.ylabel("Reservation Wage")
-# plt.title("Worker Reservation Wage vs. Age")
-# plt.legend()
-# plt.show()
+plt.figure(figsize=(8,5))
+plt.plot(ages_low, res_wages_low, marker='o', label='Low Gamma (0.01)')
+plt.plot(ages_high, res_wages_high, marker='o', label='High Gamma (0.9999)')
+plt.xlabel("Worker Age")
+plt.ylabel("Reservation Wage")
+plt.title("Worker Reservation Wage vs. Age")
+plt.legend()
+plt.show()
+
+# learning curve plot
+
+window = 500
+# low-γ run
+ma_worker_low  = np.convolve(worker_returns_low,  np.ones(window)/window, mode='valid')
+
+# high-γ run
+ma_worker_high = np.convolve(worker_returns_high, np.ones(window)/window, mode='valid')
+
+plt.figure(figsize=(8,4))
+plt.plot(ma_worker_low,  label="Worker Low γ (500-ep MA)")
+plt.plot(ma_worker_high, label="Worker High γ (500-ep MA)")
+plt.title("Age-Based Worker-Only Returns")
+plt.xlabel("Episode")
+plt.ylabel("Return (moving avg)")
+plt.legend()
+plt.tight_layout()
+plt.show()
 
 # %%
 # ---- age-based firm only mode ----
@@ -1076,30 +1110,25 @@ env_low = McCallModelEnv(age_based_mode=True, firm_only_mode=True, gamma=0.01)
 
 env_high = McCallModelEnv(age_based_mode=True, firm_only_mode=True, gamma=0.9999)
 
-# Create a DQN firm agent for each
 firm_agent_low = DQNFirmAgent(state_dim=1, n_wage_levels=100, gamma=0.01, lr=1e-3)
 firm_agent_high = DQNFirmAgent(state_dim=1, n_wage_levels=100, gamma=0.9999, lr=1e-3)
 
 # simulations
-offers_low, acceptances_low, q_net_low, age_offer_data_low = simulate(env_low, n_episodes, firm_agent_low)
-offers_high, acceptances_high, q_net_high, age_offer_data_high = simulate(env_high, n_episodes, firm_agent_high)
+offers_low, acceptances_low, q_net_low, age_offer_data_low, firm_returns_low = simulate(env_low, n_episodes, firm_agent_low)
+offers_high, acceptances_high, q_net_high, age_offer_data_high, firm_returns_high = simulate(env_high, n_episodes, firm_agent_high)
 
 # %%
-# 1) Find the maximum age actually seen in training
 max_age_low  = max(age for age, _ in age_offer_data_low)
 max_age_high = max(age for age, _ in age_offer_data_high)
 
-# 2) Freeze exploration for a pure greedy scan
 firm_agent_low.epsilon  = 0.0
 firm_agent_high.epsilon = 0.0
 
-# 3) Do the full Q‑scan 20→150
 ages_full_low,  offers_full_low  = evaluate_firm_policy_over_ages(
     firm_agent_low,  env_low,  firm_agent_low.n_wage_levels)
 ages_full_high, offers_full_high = evaluate_firm_policy_over_ages(
     firm_agent_high, env_high, firm_agent_high.n_wage_levels)
 
-# 4) Inject zeros beyond the acceptance cutoff
 offers_full_low  = [
     w if age <= max_age_low  else 0
     for age, w in zip(ages_full_low,  offers_full_low)
@@ -1109,7 +1138,6 @@ offers_full_high = [
     for age, w in zip(ages_full_high, offers_full_high)
 ]
 
-# 5) Plot the full age range, with zeros afterwards
 plt.figure(figsize=(8,5))
 plt.plot(ages_full_low,  offers_full_low,  marker='o',
          label='Low Gamma (0.01)')
@@ -1121,8 +1149,27 @@ plt.title("Firm Wage Offers vs. Age")
 plt.legend()
 plt.show()
 
+# learning plot
+window = 500
+
+# low-γ run
+ma_firm_low  = np.convolve(firm_returns_low,  np.ones(window)/window, mode='valid')
+
+# high-γ run
+ma_firm_high = np.convolve(firm_returns_high, np.ones(window)/window, mode='valid')
+
+plt.figure(figsize=(8,4))
+plt.plot(ma_firm_low,  label="Firm Low γ (500-ep MA)",  color="tab:blue")
+plt.plot(ma_firm_high, label="Firm High γ (500-ep MA)", color="tab:orange")
+plt.title("Age-Based Firm-Only Returns")
+plt.xlabel("Episode")
+plt.ylabel("Return (moving avg)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
 # %%
-# --- Simulate age-based environment with different gamma values ---
+# -------------------- AGE-BASED FIRM-WORKER INTERACTION MODE --------------------
 # low gamma
 env_age_low = McCallModelEnv(
     age_based_mode=True,
@@ -1172,14 +1219,14 @@ worker_agent_high = DQNWorkerAgent(
 )
 
 # simulation
-age_wage_data_low, acceptance_data_low = simulate_age_based(
+age_wage_data_low, acceptance_data_low, firm_returns_low, worker_returns_low = simulate_age_based(
     env_age_low, 
     n_episodes, 
     firm_agent_low, 
     worker_agent_low
     )
 
-age_wage_data_high, acceptance_data_high = simulate_age_based(
+age_wage_data_high, acceptance_data_high, firm_returns_high, worker_returns_high = simulate_age_based(
     env_age_high, 
     n_episodes, 
     firm_agent_high, 
@@ -1203,21 +1250,18 @@ plt.legend()
 plt.show()
 
 # %%
-# 1) Find the maximum age actually seen in training
+# firm interaction mode
 max_age_low  = max(age for age, _ in age_wage_data_low)
 max_age_high = max(age for age, _ in age_wage_data_high)
 
-# 2) Freeze exploration for a pure greedy scan
 firm_agent_low.epsilon  = 0.0
 firm_agent_high.epsilon = 0.0
 
-# 3) Do the full Q‑scan 20→150
 ages_full_low,  offers_full_low  = evaluate_firm_policy_over_ages(
     firm_agent_low,  env_age_low,  firm_agent_low.n_wage_levels)
 ages_full_high, offers_full_high = evaluate_firm_policy_over_ages(
     firm_agent_high, env_age_high, firm_agent_high.n_wage_levels)
 
-# 4) Inject zeros beyond the acceptance cutoff
 offers_full_low  = [
     w if age <= max_age_low  else 0
     for age, w in zip(ages_full_low,  offers_full_low)
@@ -1227,7 +1271,6 @@ offers_full_high = [
     for age, w in zip(ages_full_high, offers_full_high)
 ]
 
-# 5) Plot the full age range, with zeros afterwards
 plt.figure(figsize=(8,5))
 plt.plot(ages_full_low,  offers_full_low,  marker='o',
          label='Low Gamma (0.01)')
@@ -1239,41 +1282,68 @@ plt.title("Firm Wage Offers vs. Age (Interaction)")
 plt.legend()
 plt.show()
 
+# alternative learning plots
+
+window = 500
+
+# low-γ run
+ma_firm_int_low   = np.convolve(firm_returns_low,   np.ones(window)/window, mode='valid')
+ma_worker_int_low = np.convolve(worker_returns_low, np.ones(window)/window, mode='valid')
+
+# high-γ run
+ma_firm_int_high   = np.convolve(firm_returns_high,   np.ones(window)/window, mode='valid')
+ma_worker_int_high = np.convolve(worker_returns_high, np.ones(window)/window, mode='valid')
+
+plt.figure(figsize=(8,4))
+plt.plot(ma_firm_int_low,   label="Firm Low γ",   color="tab:blue")
+plt.plot(ma_worker_int_low, label="Worker Low γ", color="tab:orange")
+plt.plot(ma_firm_int_high,   label="Firm High γ",   linestyle='--', color="tab:blue")
+plt.plot(ma_worker_int_high, label="Worker High γ", linestyle='--', color="tab:orange")
+plt.title("Age-Based Firm-Worker Interaction Returns")
+plt.xlabel("Episode")
+plt.ylabel("Return (moving avg)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
 # %%
-# Environment setup
+# -------------------- NON-AGE-BASED MODE --------------------
+# environment setup
 worker_only_env = McCallModelEnv(worker_only_mode=True)
 firm_only_env = McCallModelEnv(firm_only_mode=True, p_exit=0.02)
 random_env = McCallModelEnv(random_mode=True, p_exit=0.02) # firm + worker but need to fix a bit (add worker)
 
-# Agent setup
+# agent setup
 firm = FirmAgent(n_states=40, n_wage_levels=20)
 worker = WorkerAgent(n_states=150, n_actions=2, use_age_based=False)
 
 # -- simulations --
 
 # worker only
-wage_bins, eval_acceptance_rates, worker_q_table = simulate(worker_only_env, n_episodes, agent=worker)
+wage_bins, eval_acceptance_rates, worker_q_table, worker_episode_returns = simulate(worker_only_env, n_episodes, agent=worker)
 worker_eval_offers, worker_eval_acceptances = evaluate(
     worker_only_env, worker, mode="worker", timesteps=100, simulations=50
 )
 
 # firm only
-total_offers, acceptance_rates, firm_q_table = simulate(firm_only_env, n_episodes, firm)
+total_offers, acceptance_rates, firm_q_table, firm_episode_returns = simulate(firm_only_env, n_episodes, firm)
 firm_eval_offers, firm_eval_acceptances = evaluate(
     firm_only_env, firm, mode="firm", timesteps=100, simulations=60
 )
 
-# mixed firm + worker
-firm_offers, worker_accepts, acceptance_rates, firm_profits = simulate(random_env, n_episodes, agent=firm)
+# mixed firm + worker interaction
+firm_offers, worker_accepts, acceptance_rates, firm_profits, firm_returns, worker_returns, = simulate(random_env, n_episodes, firm, worker)
+
+print("Worker returns:", len(worker_episode_returns))
+print("Firm returns:", len(firm_episode_returns))
 
 
 # %%
-# Define finer bins with better alignment
+# plot for worker-only acceptance rates
 num_bins = 50
 wage_bins = np.linspace(worker_only_env.wage_min, worker_only_env.wage_max + 1e-5, num_bins + 1)
 wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
 
-# Process acceptance data
 acceptance_counts = np.zeros(num_bins)
 offer_counts = np.zeros_like(acceptance_counts)
 
@@ -1283,7 +1353,6 @@ for offer, accept in zip(worker_eval_offers, worker_eval_acceptances):
         offer_counts[bin_idx] += 1
         acceptance_counts[bin_idx] += accept
 
-# Calculate acceptance rates
 eval_acceptance_rates = np.divide(
     acceptance_counts,
     offer_counts,
@@ -1292,7 +1361,7 @@ eval_acceptance_rates = np.divide(
 )
 
 plt.figure(figsize=(6, 4))
-bar_width = (wage_bins[1] - wage_bins[0]) * 0.4  # Adjust for thinner bars
+bar_width = (wage_bins[1] - wage_bins[0]) * 0.4  
 plt.bar(
     wage_bin_midpoints, 
     eval_acceptance_rates, 
@@ -1309,24 +1378,35 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
+# learning rate plot
+
+window = 500
+ma_worker = np.convolve(worker_episode_returns, np.ones(window)/window, mode='valid')
+
+plt.figure(figsize=(8,4))
+plt.plot(ma_worker, label='Worker (MA)', color='tab:blue')
+plt.ylim(55, 95)
+plt.title(f'Worker-Only Returns')
+plt.xlabel('Episode')
+plt.ylabel('Return (moving avg)')
+plt.tight_layout()
+plt.show()
 
 # %%
-# Define finer bins with better alignment
+# plot for firm-only wage offers
 num_bins = 50
 wage_bins = np.linspace(firm_only_env.wage_min, firm_only_env.wage_max + 1e-5, num_bins + 1)
 wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
 
-# Process firm wage offer frequency data
 offer_counts = np.zeros(num_bins)
 
-for offer in total_offers:  # Assuming total_offers contains all wage offers from simulations
+for offer in total_offers:  
     bin_idx = np.digitize(offer, wage_bins) - 1
     if 0 <= bin_idx < num_bins:
         offer_counts[bin_idx] += 1
 
-# Plot the firm offer frequency
 plt.figure(figsize=(6, 4))
-bar_width = (wage_bins[1] - wage_bins[0]) * 0.8  # Adjust bar width for clarity
+bar_width = (wage_bins[1] - wage_bins[0]) * 0.8  
 plt.bar(
     wage_bin_midpoints, 
     offer_counts, 
@@ -1342,28 +1422,55 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
+# learning plot
+
+window = 500
+ma_fo = np.convolve(firm_episode_returns, np.ones(window)/window, mode='valid')
+
+plt.figure(figsize=(8,4))
+plt.plot(ma_fo, color='tab:blue')
+plt.ylim(90, 140)
+plt.title(f'Firm-Only Returns')
+plt.xlabel('Episode')
+plt.ylabel('Return (moving avg)')
+plt.tight_layout()
+plt.show()
 
 # %%
-# Calculate midpoints for wage bins
+# plot for firm-worker interaction
 wage_bins = np.linspace(random_env.wage_min, random_env.wage_max, firm.n_wage_levels + 1)
 wage_bin_midpoints = (wage_bins[:-1] + wage_bins[1:]) / 2
 
-# Plot firm offers
 fig, ax = plt.subplots(figsize=(6, 4))
 ax.bar(wage_bin_midpoints, firm_offers, color='blue', alpha=0.7, label='Total Firm Offers')
-ax.set_title('Firm Wage Offer Frequency')
+ax.set_title('Firm Wage Offer Frequency (Interaction)')
 ax.set_xlabel('Wage Offered')
 ax.set_ylabel('Frequency')
 ax.legend()
 plt.tight_layout()
 plt.show()
 
-# Plot acceptance rates
 fig, ax = plt.subplots(figsize=(6, 4))
 ax.bar(wage_bin_midpoints, acceptance_rates, color='green', alpha=0.7, label='Worker Acceptance Rates')
-ax.set_title('Worker Acceptance Rates')
+ax.set_title('Worker Acceptance Rates (Interaction)')
 ax.set_xlabel('Wage Offered')
 ax.set_ylabel('Acceptance Rate')
 ax.legend()
 plt.tight_layout()
 plt.show()
+
+# learning rate
+window = 500
+firm_ma = np.convolve(firm_returns, np.ones(window)/window, mode='valid')
+worker_ma = np.convolve(worker_returns, np.ones(window)/window, mode='valid')
+
+plt.figure(figsize=(10,4))
+plt.plot(firm_ma, label='Firm (500-ep MA)')
+plt.plot(worker_ma, label='Worker (500-ep MA)')
+plt.title(f'Firm and Worker Returns')
+plt.xlabel('Episode')
+plt.ylabel('Return (moving average)')
+plt.legend()
+plt.show()
+
+
